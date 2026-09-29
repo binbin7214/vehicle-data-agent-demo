@@ -11,7 +11,14 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
+      // 前端请求 /llm/* 时转发到火山方舟（OpenAI 兼容接口），规避浏览器 CORS 限制
+      '/llm': {
+        target: 'https://ark.cn-beijing.volces.com/api/v3',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/llm/, ''),
+      },
     },
   },
 })
+
 

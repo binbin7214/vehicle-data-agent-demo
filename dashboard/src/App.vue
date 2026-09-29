@@ -2,6 +2,7 @@
 import { onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { ElMessage } from 'element-plus'
+import { parseIntent } from './utils/llm'
 
 // ---------- 筛选器 ----------
 const modelOptions = [
@@ -151,25 +152,49 @@ watch(
   () => renderChart(),
 )
 
-// ---------- 底部输入框（假语义解析） ----------
+// ---------- 底部输入框（LLM 意图解析） ----------
 const query = ref('')
+const parsing = ref(false)
 
-function handleQuery() {
+const chartTypeLabel: Record<string, string> = {
+  bar: '柱状图',
+  line: '折线图',
+}
+
+// 把 LLM 返回的中文枚举值映射回筛选器的英文 value，非法值时回退为当前值
+function matchOption(options: { label: string; value: string }[], label: string, fallback: string) {
+  return options.find((opt) => opt.label === label)?.value ?? fallback
+}
+
+async function handleQuery() {
   const text = query.value.trim()
-  if (!text) return
-  if (text.includes('上月')) filters.period = 'lastMonth'
-  else if (text.includes('上季度') || text.includes('季度')) filters.period = 'lastQuarter'
-  else if (text.includes('上周')) filters.period = 'lastWeek'
+  if (!text || parsing.value) return
 
-  if (text.includes('车型A')) filters.model = 'modelA'
-  else if (text.includes('车型B')) filters.model = 'modelB'
+  parsing.value = true
+  try {
+    const intent = await parseIntent(text, {
+      carModel: modelLabel[filters.model],
+      dateRange: periodLabel[filters.period],
+      granularity: granularityLabel[filters.granularity],
+      chartType: chartTypeLabel[filters.chartType],
+    })
 
-  if (text.includes('按周') || text.includes('周销量')) filters.granularity = 'week'
-  else if (text.includes('按月') || text.includes('月销量')) filters.granularity = 'month'
-  else if (text.includes('按天') || text.includes('日销量')) filters.granularity = 'day'
+    filters.model = matchOption(modelOptions, intent.carModel, filters.model)
+    filters.period = matchOption(periodOptions, intent.dateRange, filters.period)
+    filters.granularity = matchOption(granularityOptions, intent.granularity, filters.granularity)
+    filters.chartType = matchOption(chartTypeOptions, intent.chartType, filters.chartType)
 
-  ElMessage.success(`已按「${text}」刷新图表（模拟解析）`)
-  query.value = ''
+    ElMessage.success(`已按「${text}」更新看板`)
+    query.value = ''
+  } catch (e) {
+    if (e instanceof Error && e.message === 'PARSE_FAILED') {
+      ElMessage.warning('没听懂，请换个说法试试')
+    } else {
+      ElMessage.error(e instanceof Error ? e.message : 'AI 解析失败，请稍后再试')
+    }
+  } finally {
+    parsing.value = false
+  }
 }
 </script>
 
@@ -255,11 +280,14 @@ function handleQuery() {
         v-model="query"
         size="large"
         clearable
-        placeholder="说一句话，比如：看上周车型A的销量"
+        :disabled="parsing"
+        placeholder="说一句话，比如：看上周车型A的销量趋势"
         @keyup.enter="handleQuery"
       >
         <template #append>
-          <el-button type="primary" @click="handleQuery">查询</el-button>
+          <el-button type="primary" :loading="parsing" @click="handleQuery">
+            {{ parsing ? '解析中...' : '查询' }}
+          </el-button>
         </template>
       </el-input>
     </section>
