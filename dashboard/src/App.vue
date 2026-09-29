@@ -2,7 +2,8 @@
 import { onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { ElMessage } from 'element-plus'
-import { parseIntent } from './utils/llm'
+import { clearHistory, getParseLogs, parseIntent } from './utils/llm'
+import type { ParseLogEntry } from './utils/llm'
 
 // ---------- 筛选器 ----------
 const modelOptions = [
@@ -166,25 +167,79 @@ function matchOption(options: { label: string; value: string }[], label: string,
   return options.find((opt) => opt.label === label)?.value ?? fallback
 }
 
+// 清空多轮对话历史，下一句输入将从全新对话开始解析
+function clearConversation() {
+  clearHistory()
+  ElMessage.success('对话已清空，下一句将重新开始解析')
+}
+
+// ---------- 解析日志抽屉 ----------
+const logDrawerVisible = ref(false)
+const parseLogEntries = ref<ParseLogEntry[]>([])
+
+function openLogDrawer() {
+  // getParseLogs 返回旧 -> 新的副本，这里倒序让最新记录显示在最上面
+  parseLogEntries.value = getParseLogs().slice().reverse()
+  logDrawerVisible.value = true
+}
+
+// ---------- AI 解析结果确认（Human-in-the-loop） ----------
+const confirmVisible = ref(false)
+// 待确认的筛选条件（已做过枚举兜底映射，展示和确认生效的值完全一致）
+const pendingIntent = ref<{
+  model: string
+  period: string
+  granularity: string
+  chartType: string
+} | null>(null)
+const pendingQuery = ref('')
+
+function optionLabel(options: { label: string; value: string }[], value: string) {
+  return options.find((opt) => opt.value === value)?.label ?? value
+}
+
+// 用户点「确认」：才真正把 AI 解析结果应用到筛选器（watch 会自动刷新图表）
+function confirmIntent() {
+  if (!pendingIntent.value) return
+  filters.model = pendingIntent.value.model
+  filters.period = pendingIntent.value.period
+  filters.granularity = pendingIntent.value.granularity
+  filters.chartType = pendingIntent.value.chartType
+  confirmVisible.value = false
+  ElMessage.success(`已按「${pendingQuery.value}」更新看板`)
+  pendingIntent.value = null
+}
+
 async function handleQuery() {
   const text = query.value.trim()
   if (!text || parsing.value) return
 
   parsing.value = true
   try {
-    const intent = await parseIntent(text, {
+    const { intent, invalidFields } = await parseIntent(text, {
       carModel: modelLabel[filters.model],
       dateRange: periodLabel[filters.period],
       granularity: granularityLabel[filters.granularity],
       chartType: chartTypeLabel[filters.chartType],
     })
 
-    filters.model = matchOption(modelOptions, intent.carModel, filters.model)
-    filters.period = matchOption(periodOptions, intent.dateRange, filters.period)
-    filters.granularity = matchOption(granularityOptions, intent.granularity, filters.granularity)
-    filters.chartType = matchOption(chartTypeOptions, intent.chartType, filters.chartType)
+    // LLM 返回了不在枚举范围内的值（如 carModel 返回"车型C"），已用当前筛选器的值兜底
+    if (invalidFields.length) {
+      ElMessage.warning(
+        `${invalidFields.join('、')}的值不在可选范围内，已用当前筛选器的值替代`,
+      )
+    }
 
-    ElMessage.success(`已按「${text}」更新看板`)
+    // Human-in-the-loop：解析成功后先弹出确认卡片，不直接更新筛选器。
+    // 这里先做枚举兜底映射，保证卡片上展示的就是点「确认」后会生效的值。
+    pendingIntent.value = {
+      model: matchOption(modelOptions, intent.carModel, filters.model),
+      period: matchOption(periodOptions, intent.dateRange, filters.period),
+      granularity: matchOption(granularityOptions, intent.granularity, filters.granularity),
+      chartType: matchOption(chartTypeOptions, intent.chartType, filters.chartType),
+    }
+    pendingQuery.value = text
+    confirmVisible.value = true
     query.value = ''
   } catch (e) {
     if (e instanceof Error && e.message === 'PARSE_FAILED') {
@@ -276,21 +331,87 @@ async function handleQuery() {
 
     <!-- 底部输入框 -->
     <section class="query-bar">
-      <el-input
-        v-model="query"
-        size="large"
-        clearable
-        :disabled="parsing"
-        placeholder="说一句话，比如：看上周车型A的销量趋势"
-        @keyup.enter="handleQuery"
-      >
-        <template #append>
-          <el-button type="primary" :loading="parsing" @click="handleQuery">
-            {{ parsing ? '解析中...' : '查询' }}
-          </el-button>
-        </template>
-      </el-input>
+      <div class="query-row">
+        <el-input
+          v-model="query"
+          size="large"
+          clearable
+          class="query-input"
+          :disabled="parsing"
+          placeholder="说一句话，比如：看上周车型A的销量趋势；追问可写：那车型B呢？"
+          @keyup.enter="handleQuery"
+        >
+          <template #append>
+            <el-button type="primary" :loading="parsing" @click="handleQuery">
+              {{ parsing ? '解析中...' : '查询' }}
+            </el-button>
+          </template>
+        </el-input>
+        <el-button size="large" plain :disabled="parsing" @click="clearConversation">
+          清空对话
+        </el-button>
+        <el-button size="large" text type="info" @click="openLogDrawer">解析日志</el-button>
+      </div>
     </section>
+
+    <!-- AI 解析结果确认卡片（Human-in-the-loop） -->
+    <el-dialog
+      v-model="confirmVisible"
+      title="AI 解析结果 · 请确认"
+      width="420px"
+      :close-on-click-modal="false"
+    >
+      <div v-if="pendingIntent" class="confirm-list">
+        <div class="confirm-row">
+          <span class="confirm-label">车型</span>
+          <span class="confirm-value">{{ optionLabel(modelOptions, pendingIntent.model) }}</span>
+        </div>
+        <div class="confirm-row">
+          <span class="confirm-label">时间周期</span>
+          <span class="confirm-value">{{ optionLabel(periodOptions, pendingIntent.period) }}</span>
+        </div>
+        <div class="confirm-row">
+          <span class="confirm-label">统计颗粒度</span>
+          <span class="confirm-value">{{
+            optionLabel(granularityOptions, pendingIntent.granularity)
+          }}</span>
+        </div>
+        <div class="confirm-row">
+          <span class="confirm-label">图表类型</span>
+          <span class="confirm-value">{{ optionLabel(chartTypeOptions, pendingIntent.chartType) }}</span>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="confirmVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmIntent">确认</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- LLM 解析日志抽屉（最近 10 条） -->
+    <el-drawer v-model="logDrawerVisible" title="LLM 解析日志（最近 10 条）" size="480px">
+      <div v-if="!parseLogEntries.length" class="log-empty">暂无解析记录</div>
+      <div v-for="(log, i) in parseLogEntries" :key="i" class="log-item">
+        <div class="log-head">
+          <el-tag :type="log.success ? 'success' : 'danger'" size="small">
+            {{ log.success ? '成功' : '失败' }}
+          </el-tag>
+          <span class="log-time">{{ log.time }}</span>
+          <span class="log-duration">耗时 {{ log.durationMs }}ms</span>
+        </div>
+        <div class="log-line">
+          <span class="log-label">用户输入：</span>{{ log.userInput }}
+        </div>
+        <div class="log-label">LLM 原始返回：</div>
+        <pre class="log-pre">{{ log.rawContent || log.error }}</pre>
+        <div class="log-line">
+          <span class="log-label">解析结果：</span>
+          {{ log.parsedIntent ? JSON.stringify(log.parsedIntent) : '—' }}
+        </div>
+        <div v-if="log.invalidFields?.length" class="log-invalid">
+          已用默认值兜底：{{ log.invalidFields.join('、') }}
+        </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -393,6 +514,107 @@ async function handleQuery() {
 /* 底部输入框 */
 .query-bar {
   margin-top: 16px;
+}
+
+.query-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.query-input {
+  flex: 1;
+}
+
+/* AI 解析结果确认卡片 */
+.confirm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #f5f7fa;
+  border-radius: 4px;
+  padding: 10px 16px;
+}
+
+.confirm-label {
+  font-size: 14px;
+  color: #909399;
+}
+
+.confirm-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+}
+
+/* LLM 解析日志抽屉 */
+.log-empty {
+  color: #909399;
+  font-size: 13px;
+  text-align: center;
+  padding: 40px 0;
+}
+
+.log-item {
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.log-time {
+  font-size: 12px;
+  color: #909399;
+}
+
+.log-duration {
+  font-size: 12px;
+  color: #909399;
+  margin-left: auto;
+}
+
+.log-line {
+  font-size: 13px;
+  color: #303133;
+  margin: 4px 0;
+  word-break: break-all;
+}
+
+.log-label {
+  font-size: 12px;
+  color: #909399;
+}
+
+.log-pre {
+  margin: 4px 0;
+  padding: 8px;
+  background: #f5f7fa;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #606266;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.log-invalid {
+  font-size: 12px;
+  color: #e6a23c;
+  margin-top: 4px;
 }
 </style>
 

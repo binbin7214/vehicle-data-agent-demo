@@ -114,7 +114,7 @@ INFO:     Started reloader process
 ### 4. 启动前端
 
 第一步：回到项目根目录
-dashboard目录中
+cd ..
 
 第二步：启动前端
 npm run dev
