@@ -19,77 +19,72 @@ const granularityOptions = [
   { label: '按周', value: 'week' },
   { label: '按月', value: 'month' },
 ]
+const chartTypeOptions = [
+  { label: '柱状图', value: 'bar' },
+  { label: '折线图', value: 'line' },
+]
 
 const filters = reactive({
   model: 'all',
   period: 'lastWeek',
   granularity: 'day',
+  chartType: 'bar',
 })
 
-// ---------- 假数据生成 ----------
-// 基于筛选条件的简单伪随机，保证同一组合下数据稳定、切换筛选后数据变化
-function seededRandom(seed: number) {
-  let s = seed % 2147483647
-  if (s <= 0) s += 2147483646
-  return () => {
-    s = (s * 16807) % 2147483647
-    return (s - 1) / 2147483646
-  }
-}
-
-function hashCode(str: string) {
-  let h = 0
-  for (let i = 0; i < str.length; i++) {
-    h = (h * 31 + str.charCodeAt(i)) | 0
-  }
-  return Math.abs(h)
-}
-
-const periodPointCount: Record<string, number> = {
-  lastWeek: 7,
-  lastMonth: 30,
-  lastQuarter: 90,
-}
-
-const periodName: Record<string, string> = {
-  lastWeek: '上周',
-  lastMonth: '上月',
-  lastQuarter: '上季度',
-}
-const modelName: Record<string, string> = {
+// ---------- 筛选器值 -> 后端枚举映射 ----------
+const modelLabel: Record<string, string> = {
   all: '全部车型',
   modelA: '车型A',
   modelB: '车型B',
 }
+const periodLabel: Record<string, string> = {
+  lastWeek: '上周',
+  lastMonth: '上月',
+  lastQuarter: '上季度',
+}
+const granularityLabel: Record<string, string> = {
+  day: '按天',
+  week: '按周',
+  month: '按月',
+}
 
-function buildChartData() {
-  const count = periodPointCount[filters.period] ?? 7
+// ---------- 图表数据（来自后端接口） ----------
+const chartData = ref<{ categories: string[]; values: number[]; title: string }>({
+  categories: [],
+  values: [],
+  title: '',
+})
+const loading = ref(false)
+const loadError = ref('')
 
-  // x 轴：按天显示全部日期，按周/按月做抽样避免过密
-  const step = filters.granularity === 'day' ? 1 : filters.granularity === 'week' ? 7 : 30
-  const labels: string[] = []
-  const values: number[] = []
-  const rand = seededRandom(
-    hashCode(`${filters.model}-${filters.period}-${filters.granularity}`),
-  )
-  const base = filters.model === 'all' ? 520 : filters.model === 'modelA' ? 680 : 410
-
-  for (let i = 0; i < count; i++) {
-    const isBoundary =
-      filters.granularity === 'day' || (i + 1) % step === 0 || i === count - 1
-    if (!isBoundary) continue
-    if (filters.granularity === 'month') {
-      labels.push(`第${Math.floor(i / 30) + 1}月`)
-    } else {
-      labels.push(`D${i + 1}`)
+async function fetchData() {
+  loading.value = true
+  loadError.value = ''
+  try {
+    const resp = await fetch('/api/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        carModel: modelLabel[filters.model],
+        dateRange: periodLabel[filters.period],
+        granularity: granularityLabel[filters.granularity],
+      }),
+    })
+    if (!resp.ok) {
+      throw new Error(`接口返回状态码 ${resp.status}`)
     }
-    values.push(Math.round(base * (0.6 + rand() * 0.8)))
-  }
-
-  return {
-    title: `${periodName[filters.period]} · ${modelName[filters.model]}销量趋势（${filters.granularity === 'day' ? '按天' : filters.granularity === 'week' ? '按周' : '按月'}）`,
-    labels,
-    values,
+    const data = await resp.json()
+    chartData.value = {
+      categories: data.categories ?? [],
+      values: data.values ?? [],
+      title: data.title ?? '',
+    }
+    renderChart()
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '网络异常'
+    ElMessage.error('数据加载失败，请确认后端服务已启动（http://localhost:8000）')
+  } finally {
+    loading.value = false
   }
 }
 
@@ -99,22 +94,31 @@ let chart: echarts.ECharts | null = null
 
 function renderChart() {
   if (!chart) return
-  const { title, labels, values } = buildChartData()
+  const { title, categories, values } = chartData.value
   chart.setOption(
     {
       title: { text: title, left: 'left', textStyle: { fontSize: 15, fontWeight: 600 } },
       grid: { left: 48, right: 24, top: 56, bottom: 32 },
       tooltip: { trigger: 'axis' },
-      xAxis: { type: 'category', data: labels, axisTick: { alignWithLabel: true } },
+      xAxis: { type: 'category', data: categories, axisTick: { alignWithLabel: true } },
       yAxis: { type: 'value', name: '销量（台）' },
       series: [
-        {
-          name: '销量',
-          type: 'bar',
-          barMaxWidth: 32,
-          itemStyle: { color: '#409eff', borderRadius: [4, 4, 0, 0] },
-          data: values,
-        },
+        filters.chartType === 'line'
+          ? {
+              name: '销量',
+              type: 'line' as const,
+              smooth: true,
+              symbolSize: 6,
+              itemStyle: { color: '#409eff' },
+              data: values,
+            }
+          : {
+              name: '销量',
+              type: 'bar' as const,
+              barMaxWidth: 32,
+              itemStyle: { color: '#409eff', borderRadius: [4, 4, 0, 0] },
+              data: values,
+            },
       ],
     },
     true,
@@ -127,7 +131,7 @@ function resizeChart() {
 
 onMounted(() => {
   chart = echarts.init(chartRef.value!)
-  renderChart()
+  fetchData()
   window.addEventListener('resize', resizeChart)
 })
 
@@ -137,7 +141,15 @@ onBeforeUnmount(() => {
   chart = null
 })
 
-watch(filters, renderChart)
+// 数据相关筛选器变化 -> 请求后端；图表类型变化 -> 仅本地重渲染
+watch(
+  () => [filters.model, filters.period, filters.granularity],
+  () => fetchData(),
+)
+watch(
+  () => filters.chartType,
+  () => renderChart(),
+)
 
 // ---------- 底部输入框（假语义解析） ----------
 const query = ref('')
@@ -165,7 +177,7 @@ function handleQuery() {
   <div class="dashboard">
     <header class="dashboard-header">
       <h1 class="dashboard-title">车辆数据看板</h1>
-      <span class="dashboard-subtitle">Demo · 假数据</span>
+      <span class="dashboard-subtitle">Demo · 接口数据</span>
     </header>
 
     <!-- 顶部筛选区 -->
@@ -209,10 +221,31 @@ function handleQuery() {
           />
         </el-select>
       </div>
+
+      <div class="filter-item">
+        <label class="filter-label">图表类型</label>
+        <el-select
+          v-model="filters.chartType"
+          placeholder="请选择图表类型"
+          style="width: 160px"
+        >
+          <el-option
+            v-for="opt in chartTypeOptions"
+            :key="opt.value"
+            :label="opt.label"
+            :value="opt.value"
+          />
+        </el-select>
+      </div>
     </section>
 
     <!-- 中间图表区 -->
-    <section class="chart-card">
+    <section v-loading="loading" element-loading-text="数据加载中..." class="chart-card">
+      <div v-if="loadError" class="chart-error">
+        <p class="chart-error-title">数据加载失败</p>
+        <p class="chart-error-detail">{{ loadError }}，请确认后端服务已启动（http://localhost:8000）</p>
+        <el-button type="primary" size="small" @click="fetchData">重新加载</el-button>
+      </div>
       <div ref="chartRef" class="chart-container"></div>
     </section>
 
@@ -304,6 +337,29 @@ function handleQuery() {
 .chart-container {
   width: 100%;
   height: 400px;
+}
+
+/* 加载失败提示 */
+.chart-error {
+  height: 400px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.chart-error-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.chart-error-detail {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #909399;
 }
 
 /* 底部输入框 */
